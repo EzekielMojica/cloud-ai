@@ -16,15 +16,17 @@ Lambda function URL (streaming)           backend/src/handler.ts
 Bedrock (Nova 2 Lite)  or  your AgentCore agent
 ```
 
-All of it is defined in `template.yaml`. One command creates it and one deletes it.
+All of it is defined in `template.yaml`. GitHub Actions deploys it on every push to `main`.
 
 | Path | What it is |
 |---|---|
 | `template.yaml` | The app stack: Cognito, Lambda, S3, CloudFront |
+| `infra/github-deploy-role.yaml` | One-time bootstrap that lets GitHub Actions deploy to your account |
 | `infra/lab-roles.yaml` | The lab's step 7 IAM roles, with the PDF's bugs fixed |
+| `.github/workflows/` | `pipeline.yml` checks and deploys; `teardown.yml` deletes |
 | `backend/` | The Lambda, in TypeScript |
 | `frontend/` | The Vue app |
-| `scripts/` | Deploy, add users, tear down |
+| `scripts/` | Publish the frontend, add users, tear down from your laptop |
 
 ---
 
@@ -92,8 +94,22 @@ This stack doesn't create a budget alert, because your account already has a $1 
 ### 7. Where to look when it breaks
 
 - **The browser's Network tab**: did the request leave, and what status came back? `401` is auth, `400` is a bad request body, and a CORS error means the origin isn't in `Cors.AllowOrigins`.
-- **Lambda logs**: `sam logs --stack-name cloud-ai --tail` shows `console.error` output and stack traces live.
+- **Lambda logs**: in the Lambda console, open the `cloud-ai-ChatFunction-…` function → **Monitor** → **View CloudWatch logs**. Every `console.error` and stack trace lands there.
+- **The pipeline run**: the repo's **Actions** tab shows each step's output. A failed `Deploy the stack` step prints the CloudFormation error.
 - **CloudFormation events**: if a deploy fails, the console's stack **Events** tab shows the first resource that failed. Read the first red line, since the later ones are fallout.
+
+### 8. CI/CD without stored keys
+
+The pipeline holds no AWS keys. Each run asks GitHub for a signed token that says "this is `EzekielMojica/cloud-ai`, branch `main`". AWS checks the token against the OIDC provider you already have from `terraform-lab`, then hands out credentials for one hour. A leaked log or a fork has nothing to steal.
+
+The pipeline uses two roles (see the diagram at the top of `infra/github-deploy-role.yaml`):
+
+- **`cloud-ai-github-deploy`** is what GitHub gets. It can run CloudFormation on the `cloud-ai` stack, upload code and publish the frontend, and nothing else.
+- **`cloud-ai-cfn-exec`** is what CloudFormation uses to build the resources. It's an admin role, but only CloudFormation can assume it.
+
+That split is the same one `cdk bootstrap` creates. It has one hole you should know about: whoever can push to `main` can edit the template, and CloudFormation will build whatever it says. Pushing to `main` means deploying, so turn on branch protection once anyone else gets write access.
+
+Pull requests run the checks without AWS credentials, so a pull request can't deploy anything or read your account.
 
 ### What you can let AI handle
 
@@ -103,14 +119,9 @@ YAML syntax, SDK call shapes, the esbuild config, CSS, and bash glue. Check the 
 
 ## One-time setup
 
-**1. Install the SAM CLI.**
+The pipeline builds and deploys for you, so the laptop setup is only for running the frontend locally and adding logins.
 
-```bash
-brew install aws-sam-cli
-sam --version
-```
-
-**2. Fix your AWS credentials.** `~/.aws/credentials` on this Mac has an access key without a secret, so every AWS command fails right now. Pick one of these:
+**1. Fix your AWS credentials.** `~/.aws/credentials` on this Mac has an access key without a secret, so every AWS command fails right now. Pick one of these:
 
 - **IAM Identity Center (recommended).** It's free. Enable it in the console, create a user with the `AdministratorAccess` permission set for your account, then run:
   ```bash
@@ -127,7 +138,7 @@ Check it works:
 aws sts get-caller-identity
 ```
 
-**3. Check you can call Nova 2 Lite** (step 3 of the lab PDF covers this):
+**2. Check you can call Nova 2 Lite** (step 3 of the lab PDF covers this):
 
 ```bash
 aws bedrock-runtime converse --region us-east-1 \
@@ -135,88 +146,80 @@ aws bedrock-runtime converse --region us-east-1 \
   --messages '[{"role":"user","content":[{"text":"Say hi"}]}]'
 ```
 
-**4. Install packages.**
+**3. Install the frontend packages.**
 
 ```bash
-(cd backend && npm install)
 (cd frontend && npm install)
 ```
 
 ---
 
-## Deploy
 
-All commands run from this folder.
+## First deploy
 
-**1. Lab roles** (replaces step 7 of the PDF):
+You do steps 1 to 3 once, in the AWS console and on GitHub. After that, every push to `main` deploys.
 
-```bash
-aws cloudformation deploy --region us-east-1 \
-  --template-file infra/lab-roles.yaml \
-  --stack-name cloud-ai-lab-roles \
-  --capabilities CAPABILITY_NAMED_IAM
-```
+Before you start, sign in to your **personal** AWS account. Check the account ID in the top-right menu, and set the region selector next to it to **US East (N. Virginia) us-east-1**.
 
-If you already ran step 7 in CloudShell, the roles exist and this fails with "already exists". Delete those three roles in the IAM console first.
+**1. Create the lab roles** (replaces step 7 of the PDF)
 
-**2. App stack:**
+1. Open **CloudFormation** → **Create stack** → **With new resources (standard)**.
+2. Choose **Upload a template file**, pick `infra/lab-roles.yaml`, then **Next**.
+3. Stack name: `cloud-ai-lab-roles`. **Next**, then **Next** again.
+4. Tick **I acknowledge that AWS CloudFormation might create IAM resources with custom names**, then **Submit**.
+5. Wait for `CREATE_COMPLETE`.
 
-```bash
-sam build
-sam deploy --guided
-```
+If you already ran step 7 in CloudShell, this fails with "already exists". Delete the three `Demo…Role` roles in the IAM console, then delete the failed stack and try again.
 
-The guided deploy asks a few questions and saves your answers to `samconfig.toml`. From then on, `sam build && sam deploy` is enough.
+**2. Create the pipeline's roles** (the bootstrap)
 
-- Stack name: `cloud-ai`
-- Region: `us-east-1`
-- Leave the parameters at their defaults
-- "ChatFunction Function Url has no authentication. Is this okay?" → `y`. The handler checks the token itself (see "What you must know", #4).
-- Accept the defaults for the rest
+1. Same as above, but upload `infra/github-deploy-role.yaml` and name the stack `cloud-ai-bootstrap`.
+2. On the parameters page, leave **CreateOidcProvider** set to `false`. Your account already has the GitHub provider from `terraform-lab`, and an account can hold only one.
+3. Tick the IAM acknowledgement and **Submit**.
+4. When it shows `CREATE_COMPLETE`, open the **Outputs** tab and copy **DeployRoleArn**.
 
-The first deploy takes about 5 minutes, mostly waiting for CloudFront.
+**3. Give the ARN to GitHub**
 
-**3. Create logins** for yourself and your teacher:
+1. Open https://github.com/EzekielMojica/cloud-ai → **Settings** → **Secrets and variables** → **Actions**.
+2. **New repository secret**. Name: `AWS_DEPLOY_ROLE_ARN`. Value: the ARN you copied. **Add secret**.
+
+It's a secret rather than a variable because it contains your account ID, and the logs of a public repo are public.
+
+**4. Run the pipeline**
+
+Go to the **Actions** tab → **Pipeline** → **Run workflow** → **Run workflow**. (Any push to `main` does the same.) The first run takes about 6 minutes, mostly waiting for CloudFront. The last step prints the site URL.
+
+Before step 3 is done, the pipeline still runs its checks and skips the deploy with a notice instead of failing.
+
+**5. Create logins** for yourself and your teacher, from your laptop:
 
 ```bash
 scripts/create-user.sh you@example.com
 scripts/create-user.sh teacher@school.edu
 ```
 
-**4. Publish the frontend:**
-
-```bash
-scripts/deploy-frontend.sh
-```
-
-It prints the site URL. Open it and log in.
+The pipeline doesn't do this because it would need the passwords.
 
 ---
 
 ## Local development
 
 ```bash
-scripts/write-env.sh     # once, after the stack exists
+scripts/write-env.sh     # once, after the first deploy
 cd frontend && npm run dev
 ```
 
 Open http://localhost:5173. Your local frontend talks to the real Lambda in AWS, which already allows that origin.
 
-After changing the backend, run `sam build && sam deploy`. After changing the frontend, run `scripts/deploy-frontend.sh`.
+To ship a change, commit and push to `main`. Open a pull request first if you want the checks to run before it deploys.
 
 ---
 
 ## Plug in your AgentCore agent
 
-By default the Lambda calls Nova 2 Lite directly. Once you've done the AgentCore exercise and run `agentcore deploy`, copy the agent ARN it prints. Open `samconfig.toml` and set `AgentRuntimeArn` in the `parameter_overrides` line:
+By default the Lambda calls Nova 2 Lite directly. Once you've done the AgentCore exercise and run `agentcore deploy`, copy the agent ARN it prints. Add it as a second repository secret named `AGENT_RUNTIME_ARN`, then run the pipeline again.
 
-```toml
-parameter_overrides = "ModelId=\"us.amazon.nova-2-lite-v1:0\" FoundationModelId=\"amazon.nova-2-lite-v1:0\" AgentRuntimeArn=\"arn:aws:bedrock-agentcore:us-east-1:...:runtime/...\""
-```
-
-Then run `sam build && sam deploy`. Editing the file keeps your other parameters. Passing `--parameter-overrides` on the command line would replace them all.
-
-The Lambda then sends `{"prompt": "..."}` to your agent, the same payload as the lab's `math_client.py`. It also passes the browser's session ID, so the agent keeps context across messages. To switch back, set `AgentRuntimeArn=\"\"` and deploy again.
+The Lambda then sends `{"prompt": "..."}` to your agent, the same payload as the lab's `math_client.py`. It also passes the browser's session ID, so the agent keeps context across messages. To switch back to the plain model, delete the secret and run the pipeline again.
 
 ---
 
@@ -224,10 +227,11 @@ The Lambda then sends `{"prompt": "..."}` to your agent, the same payload as the
 
 Do this when the lab is graded.
 
-```bash
-scripts/destroy.sh                                              # app stack
-aws cloudformation delete-stack --stack-name cloud-ai-lab-roles --region us-east-1
-agentcore destroy --agent <agent name>                          # for each agent you deployed
-```
+1. **App stack:** **Actions** tab → **Teardown** → **Run workflow** → type `DELETE`.
+2. **Bootstrap:** in CloudFormation, the `cloud-ai-artifacts-…` bucket has to be empty first. Open it in S3 and choose **Empty**, then delete the `cloud-ai-bootstrap` stack.
+3. **Lab roles:** delete the `cloud-ai-lab-roles` stack.
+4. **Agents:** run `agentcore destroy --agent <agent name>` for each agent you deployed.
 
-Then open the Billing console the next day and check nothing is still running.
+Delete them in that order. The pipeline needs the bootstrap roles to delete the app stack.
+
+Open the Billing console the next day and check nothing is still running.

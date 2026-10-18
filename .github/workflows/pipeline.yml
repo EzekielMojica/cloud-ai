@@ -1,0 +1,135 @@
+name: Pipeline
+
+# Pull requests run the checks only. Pushes to main run the checks, then deploy.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK: cloud-ai
+
+jobs:
+  check:
+    name: Lint, typecheck, build
+    runs-on: ubuntu-latest
+    # No AWS credentials here, so a pull request from a fork can't reach your account.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Lint CloudFormation templates
+        run: |
+          pip install --quiet cfn-lint==1.46.0
+          cfn-lint template.yaml infra/*.yaml
+
+      - name: Typecheck the Lambda
+        working-directory: backend
+        run: |
+          npm ci
+          npm run typecheck
+
+      - name: Build the frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+  # Skips the deploy, instead of failing it, until the bootstrap is done.
+  gate:
+    name: Deploy configured?
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        env:
+          ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          if [ -n "$ROLE" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::AWS_DEPLOY_ROLE_ARN isn't set, so the deploy was skipped. See README → CI/CD."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    name: Deploy to AWS
+    needs: [check, gate]
+    if: needs.gate.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    # Never run two deploys at once; queue the second one instead.
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # lets the job ask GitHub for the OIDC token AWS checks
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+        with:
+          use-installer: true
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # The repo is public, and so are its logs. Hide the account ID in them.
+          mask-aws-account-id: true
+
+      - name: Find the bootstrap resources
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "ARTIFACT_BUCKET=$STACK-artifacts-$ACCOUNT_ID-$AWS_REGION" >> "$GITHUB_ENV"
+          echo "EXEC_ROLE_ARN=arn:aws:iam::$ACCOUNT_ID:role/$STACK-cfn-exec" >> "$GITHUB_ENV"
+
+      - name: Build the Lambda
+        run: sam build
+
+      - name: Deploy the stack
+        env:
+          AGENT_RUNTIME_ARN: ${{ secrets.AGENT_RUNTIME_ARN }}
+        run: |
+          sam deploy \
+            --stack-name "$STACK" \
+            --region "$AWS_REGION" \
+            --s3-bucket "$ARTIFACT_BUCKET" \
+            --s3-prefix "$STACK" \
+            --role-arn "$EXEC_ROLE_ARN" \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --parameter-overrides "AgentRuntimeArn=\"$AGENT_RUNTIME_ARN\"" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --no-progressbar
+
+      - name: Publish the frontend
+        run: |
+          (cd frontend && npm ci)
+          scripts/deploy-frontend.sh

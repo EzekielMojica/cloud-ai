@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  One-time bootstrap so GitHub Actions can deploy the cloud-ai stack.
+  Deploy it from your laptop once. After that, pushes to main deploy themselves.
+
+# How the pieces fit:
+#
+#   GitHub Actions ──OIDC──► GitHubDeployRole ──passes──► CfnExecRole
+#   (main branch only)       (can run CloudFormation      (CloudFormation uses
+#                             on the cloud-ai stack,       this to create the
+#                             upload code, publish the     Lambda, Cognito,
+#                             frontend; nothing else)      CloudFront...)
+#
+# The pipeline's own credentials can't touch anything outside the cloud-ai
+# stack, its artifact bucket and its site bucket. CloudFormation does the
+# building with CfnExecRole. AWS CDK sets up the same split when you run
+# `cdk bootstrap`.
+#
+# Be honest about the limit: CfnExecRole is an admin role, so anyone who can
+# push to main can change the template and make it create anything. The trust
+# condition on GitHubDeployRole is what keeps strangers out, so protect main.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: EzekielMojica/cloud-ai
+    Description: owner/name of the repo allowed to deploy
+  AppStackName:
+    Type: String
+    Default: cloud-ai
+    Description: Stack name the pipeline deploys. Must match STACK in the workflow
+  CreateOidcProvider:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      An AWS account can hold only one GitHub OIDC provider. Leave "false" if one
+      already exists (terraform-lab created it). Set "true" in a fresh account
+
+Conditions:
+  MakeProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  # SAM uploads the bundled Lambda code here before CloudFormation deploys it.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppStackName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldBuilds
+            Status: Enabled
+            ExpirationInDays: 30
+
+  CfnExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppStackName}-cfn-exec"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppStackName}-github-deploy"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - MakeProvider
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Only workflows running on main in this one repo. Pull
+                # requests, other branches and forks get nothing.
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepo}:ref:refs/heads/main"
+      Policies:
+        - PolicyName: DeployCloudAi
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunTheStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:DeleteStack
+                Resource:
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*"
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/*"
+              - Sid: ExpandSamShorthand
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
+              - Sid: ReadTemplates
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: "*"
+              - Sid: HandTheWorkToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: UploadLambdaCode
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              # CloudFormation names the site bucket <stack>-sitebucket-<random>.
+              - Sid: PublishFrontend
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${AppStackName}-sitebucket-*"
+                  - !Sub "arn:aws:s3:::${AppStackName}-sitebucket-*/*"
+              - Sid: RefreshCdnCache
+                Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
+
+Outputs:
+  DeployRoleArn:
+    Description: Save this as the AWS_DEPLOY_ROLE_ARN secret in the GitHub repo
+    Value: !GetAtt GitHubDeployRole.Arn
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  CfnExecRoleArn:
+    Value: !GetAtt CfnExecRole.Arn

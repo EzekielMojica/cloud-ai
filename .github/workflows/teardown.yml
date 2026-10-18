@@ -1,0 +1,45 @@
+name: Teardown
+
+# Manual only: Actions tab → Teardown → Run workflow → type DELETE.
+# Deletes the app stack. The bootstrap stack and the lab roles stay; delete
+# those from your laptop (see README → Tear down).
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type DELETE to remove the cloud-ai stack and everything in it
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  STACK: cloud-ai
+
+jobs:
+  teardown:
+    name: Delete the app stack
+    if: github.event.inputs.confirmation == 'DELETE'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      # CloudFormation won't delete a bucket that still has files in it.
+      - name: Empty the site bucket
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='SiteBucketName'].OutputValue" --output text)
+          aws s3 rm "s3://$BUCKET" --recursive
+
+      - name: Delete the stack
+        run: |
+          aws cloudformation delete-stack --stack-name "$STACK"
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+          echo "Deleted $STACK."
