@@ -100,7 +100,7 @@ This stack doesn't create a budget alert, because your account already has a $1 
 
 ### 8. CI/CD without stored keys
 
-The pipeline holds no AWS keys. Each run asks GitHub for a signed token that says "this is `EzekielMojica/cloud-ai`, branch `main`". AWS checks the token against the OIDC provider you already have from `terraform-lab`, then hands out credentials for one hour. A leaked log or a fork has nothing to steal.
+The pipeline holds no AWS keys. Each run asks GitHub for a signed token that says "this is `EzekielMojica/cloud-ai`, branch `main`". The token names the repo by its numeric ID as well as its name (`repo:EzekielMojica@26315001/cloud-ai@1424121947:ref:refs/heads/main`), because GitHub switched new repos to that format in July 2026. If the trust policy expects the old name-only format, you get "Not authorized to perform sts:AssumeRoleWithWebIdentity". AWS checks the token against the OIDC provider you already have from `terraform-lab`, then hands out credentials for one hour. A leaked log or a fork has nothing to steal.
 
 The pipeline uses two roles (see the diagram at the top of `infra/github-deploy-role.yaml`):
 

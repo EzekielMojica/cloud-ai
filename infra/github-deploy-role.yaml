@@ -21,10 +21,22 @@ Description: >-
 # condition on GitHubDeployRole is what keeps strangers out, so protect main.
 
 Parameters:
-  GitHubRepo:
+  # Repos created after 15 July 2026 identify themselves to AWS with numeric
+  # IDs as well as names: repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:... A repo
+  # someone recreates under the same name gets a new ID, so it can't reuse
+  # this role. Look the IDs up with: gh api repos/OWNER/REPO -q '.owner.id, .id'
+  GitHubOwner:
     Type: String
-    Default: EzekielMojica/cloud-ai
-    Description: owner/name of the repo allowed to deploy
+    Default: EzekielMojica
+  GitHubOwnerId:
+    Type: String
+    Default: "26315001"
+  GitHubRepoName:
+    Type: String
+    Default: cloud-ai
+  GitHubRepoId:
+    Type: String
+    Default: "1424121947"
   AppStackName:
     Type: String
     Default: cloud-ai
@@ -102,7 +114,7 @@ Resources:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
                 # Only workflows running on main in this one repo. Pull
                 # requests, other branches and forks get nothing.
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepo}:ref:refs/heads/main"
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepoName}@${GitHubRepoId}:ref:refs/heads/main"
       Policies:
         - PolicyName: DeployCloudAi
           PolicyDocument:
