@@ -1,0 +1,12 @@
+# Dependencies and build output
+node_modules/
+.aws-sam/
+frontend/dist/
+
+# Local config: stack outputs and your SAM answers (profile, parameters)
+.env*.local
+samconfig.toml
+
+# Editor and tool noise
+.DS_Store
+*.log

@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  IAM roles for the AgentCore exercises. Replaces step 7 of the lab PDF.
+  The role names match the lab so its instructions still work.
+
+# Changes from the PDF commands:
+#   - ARNs use ${AWS::Region} and ${AWS::AccountId}, so they resolve to your
+#     real region and account. The PDF left REGION, ACCOUNT and AWS_ACCOUNTID
+#     as literal text, so those statements matched nothing.
+#   - The trust policies check aws:SourceAccount against your real account ID.
+#     The PDF read $AWS_ACCOUNTID, which CloudShell may leave empty.
+#   - Drops two IAM actions that do not exist (see the Bedrock statement).
+#   - One `delete-stack` removes all three roles.
+
+Resources:
+  # Execution role for the tool Lambda the Gateway exercise creates.
+  DemoToolLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DemoToolLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Lets AgentCore Gateway call the tool Lambda.
+  DemoGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DemoGatewayRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeDemoToolLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:DemoToolLambda*"
+
+  # The role your deployed agent runs as inside AgentCore Runtime.
+  DemoRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DemoRuntimeRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: DemoRuntimePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The PDF also listed bedrock:Converse and bedrock:ConverseStream.
+              # Those aren't IAM actions: the Converse API is authorized by
+              # InvokeModel, and ConverseStream by InvokeModelWithResponseStream.
+              - Sid: Bedrock
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/*
+                  - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Sid: Gateway
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+              - Sid: Observability
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              - Sid: CodeArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::bedrock-agentcore-*
+                  - arn:aws:s3:::bedrock-agentcore-*/*
+              - Sid: ECR
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: "*"
+
+Outputs:
+  DemoToolLambdaRoleArn:
+    Value: !GetAtt DemoToolLambdaRole.Arn
+  DemoGatewayRoleArn:
+    Value: !GetAtt DemoGatewayRole.Arn
+  DemoRuntimeRoleArn:
+    Value: !GetAtt DemoRuntimeRole.Arn

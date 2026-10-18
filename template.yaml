@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# SAM is a CloudFormation extension. This line tells CloudFormation to expand
+# the AWS::Serverless::* shorthand into plain resources before deploying.
+Transform: AWS::Serverless-2016-10-31
+Description: Cloud AI - chat frontend on S3/CloudFront, Cognito login, streaming Lambda in front of Bedrock or AgentCore
+
+Parameters:
+  ModelId:
+    Type: String
+    Default: us.amazon.nova-2-lite-v1:0
+    Description: Inference profile ID the Lambda calls when no agent is set
+  FoundationModelId:
+    Type: String
+    Default: amazon.nova-2-lite-v1:0
+    Description: The model behind ModelId. IAM needs both (see README, "Inference profiles")
+  AgentRuntimeArn:
+    Type: String
+    Default: ""
+    Description: Optional. ARN printed by `agentcore deploy`. When set, the Lambda calls your agent instead of the model
+
+Conditions:
+  UseAgent: !Not [!Equals [!Ref AgentRuntimeArn, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- Login
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      UserPoolTier: LITE
+      # Nobody can sign themselves up. You create accounts with scripts/create-user.sh.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes: [email]
+      UsernameConfiguration:
+        CaseSensitive: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: web
+      # Browser apps can't keep a secret, so the client has none.
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+
+  # ---------------------------------------------------------------- Backend
+  ChatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: handler.handler
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      MemorySize: 512
+      # Agents that call tools can run for minutes. Function URLs allow up to 15.
+      Timeout: 300
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+          MODEL_ID: !Ref ModelId
+          AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
+      # AuthType NONE means AWS lets any request through to the code.
+      # The handler then rejects anything without a valid Cognito token.
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: RESPONSE_STREAM
+        Cors:
+          AllowOrigins:
+            - !Sub "https://${SiteDistribution.DomainName}"
+            - http://localhost:5173
+          AllowMethods: [POST]
+          AllowHeaders: [authorization, content-type]
+          MaxAge: 300
+      Policies:
+        - Statement:
+            # Calling a "us." inference profile needs permission on the profile
+            # and on the model in every region the profile can route to.
+            - Effect: Allow
+              Action: bedrock:InvokeModelWithResponseStream
+              Resource:
+                - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${ModelId}"
+                - !Sub "arn:aws:bedrock:*::foundation-model/${FoundationModelId}"
+            - !If
+              - UseAgent
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Ref AgentRuntimeArn
+                  - !Sub "${AgentRuntimeArn}/*"
+              - !Ref AWS::NoValue
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: es2022
+        EntryPoints:
+          - src/handler.ts
+
+  ChatFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ChatFunction}"
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------- Frontend hosting
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # The bucket stays private. Only CloudFront can read it.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-site"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} frontend"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # AWS managed policy "CachingOptimized"
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+Outputs:
+  SiteUrl:
+    Value: !Sub "https://${SiteDistribution.DomainName}"
+  ApiUrl:
+    Value: !GetAtt ChatFunctionUrl.FunctionUrl
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref SiteDistribution
+  FunctionName:
+    Value: !Ref ChatFunction
