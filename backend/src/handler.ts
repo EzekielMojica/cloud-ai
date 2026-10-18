@@ -25,16 +25,28 @@ type ChatMessage = { role: 'user' | 'assistant'; text: string };
 type ChatRequest = { messages: ChatMessage[]; sessionId: string };
 
 export const handler = awslambda.streamifyResponse(async (event: LambdaFunctionURLEvent, responseStream) => {
-  const open = (statusCode: number) =>
-    awslambda.HttpResponseStream.from(responseStream, {
+  // The runtime sends the status and headers inside its own write(), right
+  // before the first chunk. end(chunk) skips that hook, so a response that never
+  // calls write() reaches the function URL without a status and becomes a 502.
+  // The empty write() sends the status straight away.
+  const open = (statusCode: number) => {
+    const stream = awslambda.HttpResponseStream.from(responseStream, {
       statusCode,
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     });
+    stream.write('');
+    return stream;
+  };
+  const reject = (statusCode: number, message: string) => {
+    const stream = open(statusCode);
+    stream.write(message);
+    stream.end();
+  };
 
   try {
     await verifier.verify(bearerToken(event));
   } catch {
-    open(401).end('Unauthorized');
+    reject(401, 'Unauthorized');
     return;
   }
 
@@ -42,7 +54,7 @@ export const handler = awslambda.streamifyResponse(async (event: LambdaFunctionU
   try {
     request = parseRequest(event);
   } catch (err) {
-    open(400).end((err as Error).message);
+    reject(400, (err as Error).message);
     return;
   }
 
