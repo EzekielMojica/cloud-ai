@@ -141,7 +141,9 @@ Resources:
         Comment: !Sub "${AWS::StackName} frontend"
         DefaultRootObject: index.html
         HttpVersion: http2and3
-        PriceClass: PriceClass_100
+        # 100 only covers North America, Europe and Israel. 200 adds Asia
+        # edges (Singapore, Manila, Tokyo...), so the page loads from nearby.
+        PriceClass: PriceClass_200
         Origins:
           - Id: site
             DomainName: !GetAtt SiteBucket.RegionalDomainName
