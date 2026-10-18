@@ -191,14 +191,19 @@ Go to the **Actions** tab → **Pipeline** → **Run workflow** → **Run workfl
 
 Before step 3 is done, the pipeline still runs its checks and skips the deploy with a notice instead of failing.
 
-**5. Create logins** for yourself and your teacher, from your laptop:
+**5. Create logins** for yourself and your teacher
 
-```bash
-scripts/create-user.sh you@example.com
-scripts/create-user.sh teacher@school.edu
-```
+1. Open **Cognito** → **User pools** → `cloud-ai-users` → **Users** → **Create user**.
+2. **Invitation message:** **Don't send an invitation**. You'll pass the password on yourself.
+3. **Email address:** the person's email. Tick **Mark email address as verified**.
+4. **Temporary password:** **Set a password**, and use at least 12 characters.
+5. **Create user**.
 
-The pipeline doesn't do this because it would need the passwords.
+The first time someone logs in, the site asks them to choose their own password, and the temporary one stops working. Send your teacher the site URL and the temporary password separately.
+
+With a working AWS CLI, `scripts/create-user.sh teacher@school.edu` sets a permanent password instead, so that person skips the new-password step.
+
+The pipeline doesn't create users, because it would need the passwords.
 
 ---
 

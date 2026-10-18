@@ -38,6 +38,7 @@ body { margin: 0; background: var(--bg); }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
 .login { display: flex; flex-direction: column; gap: 14px; max-width: 360px; width: 100%; margin: 10vh auto 0; }
 .login h1 { margin: 0; font-size: 20px; }
+.login .muted { margin: 0; font-size: 14px; }
 label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
 
 input { font: inherit; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
